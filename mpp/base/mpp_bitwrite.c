@@ -21,7 +21,17 @@
 
 MPP_RET mpp_writer_status(MppWriteCtx *ctx)
 {
-    if (ctx->byte_cnt > ctx->size) {
+    if (ctx->overflow || ctx->byte_cnt > ctx->size) {
+        ctx->overflow = 1;
+        return MPP_NOK;
+    }
+
+    return MPP_OK;
+}
+
+static MPP_RET mpp_writer_check_size(MppWriteCtx *ctx, RK_U32 size)
+{
+    if (mpp_writer_status(ctx) || size > ctx->size - ctx->byte_cnt) {
         ctx->overflow = 1;
         return MPP_NOK;
     }
@@ -76,8 +86,11 @@ void mpp_writer_put_raw_bits(MppWriteCtx *ctx, RK_S32 val, RK_S32 len)
     mpp_assert(len < 25);
 
     bits = len + ctx->buffered_bits;
-    val <<= (32 - bits);
-    byte_buffer = byte_buffer | val;
+    /* Include the partial byte that flush will eventually store. */
+    if (mpp_writer_check_size(ctx, (bits + 7) / 8))
+        return;
+
+    byte_buffer = byte_buffer | ((RK_U32) val << (32 - bits));
 
     while (bits > 7) {
         *stream = (RK_U8)(byte_buffer >> 24);
@@ -103,7 +116,7 @@ void mpp_writer_flush(MppWriteCtx *ctx)
     if (mpp_writer_status(ctx))
         return;
 
-    if (ctx->buffered_bits)
+    if (ctx->buffered_bits && !mpp_writer_check_size(ctx, 1))
         *stream = (RK_U8)(byte_buffer >> 24);
 
     return;
@@ -114,6 +127,13 @@ void mpp_writer_put_bits(MppWriteCtx * ctx, RK_S32 val, RK_S32 len)
     RK_S32 bits;
     RK_U8 *stream = ctx->stream;
     RK_U32 byte_buffer = ctx->byte_buffer;
+    RK_U32 check_buffer;
+    RK_U32 check_zero_bytes = ctx->zero_bytes;
+    RK_U32 required = 0;
+    RK_S32 check_bits;
+
+    if (mpp_writer_status(ctx))
+        return;
 
     if (val) {
         mpp_assert(val < (1 << len));
@@ -123,12 +143,29 @@ void mpp_writer_put_bits(MppWriteCtx * ctx, RK_S32 val, RK_S32 len)
 
     byte_buffer = byte_buffer | ((RK_U32) val << (32 - bits));
 
+    /* Reserve the exact output size, including emulation-prevention bytes,
+     * before changing the stream or writer state. */
+    check_buffer = byte_buffer;
+    check_bits = bits;
+    while (check_bits > 7) {
+        RK_U8 byte = (RK_U8)(check_buffer >> 24);
+
+        if (check_zero_bytes == 2 && byte < 4) {
+            required++;
+            check_zero_bytes = 0;
+        }
+        required++;
+        check_zero_bytes = byte == 0 ? check_zero_bytes + 1 : 0;
+        check_buffer <<= 8;
+        check_bits -= 8;
+    }
+    required += check_bits > 0;
+    if (mpp_writer_check_size(ctx, required))
+        return;
+
     while (bits > 7) {
         RK_S32 zeroBytes = ctx->zero_bytes;
         RK_S32 byteCnt = ctx->byte_cnt;
-
-        if (mpp_writer_status(ctx))
-            return;
 
         *stream = (RK_U8) (byte_buffer >> 24);
 
